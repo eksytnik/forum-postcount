@@ -12,6 +12,10 @@ on:
       max_requests:
         description: 'Лимит запросов за запуск'
         default: '400'
+      full:
+        description: 'Полная проверка всех тем (если удаляли темы или переносили эпизоды из других разделов)'
+        type: boolean
+        default: false
       check_uids:
         description: 'id игроков для сверки, через запятую'
         default: ''
@@ -26,7 +30,7 @@ concurrency:
 jobs:
   count:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
 
@@ -49,6 +53,7 @@ jobs:
           DATA_DIR: data
           MAX_REQUESTS: ${{ inputs.max_requests || '400' }}
           DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+          FULL: ${{ inputs.full && 'true' || 'false' }}
           CHECK_UIDS: ${{ inputs.check_uids }}
         run: node updater/update.mjs
 
