@@ -30,6 +30,8 @@ const MIN_INTERVAL_MS = +env.MIN_INTERVAL_MS || 1500;
 const MAX_MINUTES = +env.MAX_MINUTES || 45; // запуск заканчивается сам, не дожидаясь таймаута GitHub
 const DRY_RUN = env.DRY_RUN === 'true';
 const STORAGE_KEY = env.STORAGE_KEY || 'gameposts';
+// Служебные пометки об архиве («нет игры больше месяца, в архив») не считаются.
+const NOTE_RE = new RegExp(env.NOTE_RE || 'нет\\s+игры\\s+больше\\s+месяца', 'i');
 const CHECK_UIDS = (env.CHECK_UIDS || '').split(',').filter(Boolean);
 const PAGE = 100;
 const OVERLAP_S = 3600; // запас по времени при чтении «свежих» тем
@@ -201,6 +203,17 @@ async function fetchPosts(topicIds, expectedTotal) {
   }
 }
 
+// Текст поста без разметки, для сравнения с NOTE_RE.
+function plainText(html) {
+  return String(html || '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&nbsp;|&#160;/g, ' ')
+    .replace(/&[a-z#0-9]+;/gi, ' ')
+    .replace(/ё/gi, 'е')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function countByUser(posts) {
   const byTopic = new Map();
   for (const p of posts) {
@@ -212,7 +225,7 @@ function countByUser(posts) {
     const firstId = Math.min(...list.map((p) => +p.id));
     const c = {};
     for (const p of list) {
-      if (+p.id === firstId || +p.user_id <= 1) continue;
+      if (+p.id === firstId || +p.user_id <= 1 || state.excluded[p.id]) continue;
       c[p.user_id] = (c[p.user_id] || 0) + 1;
     }
     result.set(tid, { c, n: list.length, lp: Math.max(...list.map((p) => +p.id)) });
@@ -240,6 +253,7 @@ const publicPath = path.join(DATA_DIR, 'postcount.json');
 const state = fs.existsSync(statePath)
   ? JSON.parse(fs.readFileSync(statePath, 'utf8'))
   : { topics: {} };
+state.excluded = state.excluded || {}; // id постов-пометок, которые не считаются
 // topics[id] = { f: раздел, lp, nr: отпечаток, c: {user_id: постов}, ok: счёт соответствует отпечатку }
 
 const isFull = FULL || !Object.keys(state.topics).length;
@@ -312,6 +326,28 @@ try {
       else Object.assign(s, { c: r.c, nr: r.n - 1, lp: r.lp, ok: true });
     }
   }
+
+  // Пометки об архиве. Проверяем последний пост каждой посчитанной темы, если ещё не проверяли
+  // этот пост (nc — id проверенного последнего поста). Первый раз — все темы, около 185 запросов,
+  // дальше — только изменившиеся. Пометку вычитаем из счёта автора и запоминаем в excluded.
+  const toCheck = Object.entries(state.topics).filter(([, s]) => s.ok && s.lp && s.nc !== s.lp);
+  let notesFound = 0;
+  for (let i = 0; i < toCheck.length; i += PAGE) {
+    const chunk = toCheck.slice(i, i + PAGE);
+    const posts = await api({ method: 'post.get', post_id: chunk.map(([, s]) => s.lp).join(','), fields: 'id,topic_id,user_id,message', limit: PAGE });
+    const byId = new Map(posts.map((p) => [String(p.id), p]));
+    for (const [tid, s] of chunk) {
+      const p = byId.get(String(s.lp));
+      if (p && !state.excluded[p.id] && NOTE_RE.test(plainText(p.message))) {
+        state.excluded[p.id] = 1;
+        notesFound++;
+        const u = p.user_id;
+        if (s.c && s.c[u] > 0 && String(p.topic_id) === tid) { if (--s.c[u] === 0) delete s.c[u]; }
+      }
+      s.nc = s.lp;
+    }
+  }
+  if (toCheck.length) console.log(`Проверено последних постов: ${toCheck.length}, найдено пометок об архиве: ${notesFound} (всего исключено: ${Object.keys(state.excluded).length})`);
 } catch (e) {
   if (e instanceof BudgetExhausted) stopReason = `исчерпан лимит запросов (${MAX_REQUESTS}) или времени (${MAX_MINUTES} мин), продолжим в следующий запуск`;
   else if (e instanceof StopRun) stopReason = e.message;
