@@ -55,6 +55,7 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
           FULL: ${{ inputs.full && 'true' || 'false' }}
           CHECK_UIDS: ${{ inputs.check_uids }}
+          NOTE_RE: ${{ vars.NOTE_RE }}
         run: node updater/update.mjs
 
       # Ветка data перезаписывается целиком, история не растёт.
