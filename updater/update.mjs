@@ -125,30 +125,53 @@ async function login() {
 
 // ---------- Подсчёт ----------
 
+// Все темы раздела. Форум не даёт листать дальше skip = 10000, поэтому большой раздел
+// читаем с двух концов одного и того же порядка (по последнему посту): сначала от старых,
+// потом от новых — пока не встретим уже прочитанную тему.
+const MAX_SKIP = 10000;
+
+function checkOrder(page, forumId, dir) {
+  let prev = dir === 'asc' ? -Infinity : Infinity;
+  for (const t of page) {
+    if (t.sticky === '1') continue; // закреплённые могут стоять вне сортировки
+    const d = +t.last_post_date;
+    if (dir === 'asc' ? d < prev : d > prev) {
+      throw new StopRun(`Раздел ${forumId}: темы пришли не по дате последнего поста (${dir}).`);
+    }
+    prev = d;
+  }
+}
+
 async function listTopics(forumId) {
-  const out = [];
+  const seen = new Map();
+  const params = { method: 'topic.get', forum_id: forumId, limit: PAGE, sort_by: 'last_post' };
   for (let skip = 0; ; skip += PAGE) {
-    const page = await api({ method: 'topic.get', forum_id: forumId, limit: PAGE, skip });
-    out.push(...page);
-    if (page.length < PAGE) return out;
+    const page = await api({ ...params, sort_dir: 'asc', skip });
+    checkOrder(page, forumId, 'asc');
+    for (const t of page) seen.set(t.id, t);
+    if (page.length < PAGE) return [...seen.values()]; // раздел прочитан целиком
+    if (skip + PAGE > MAX_SKIP) break;
+  }
+  for (let skip = 0; ; skip += PAGE) {
+    const page = await api({ ...params, sort_dir: 'desc', skip });
+    checkOrder(page, forumId, 'desc');
+    let met = false;
+    for (const t of page) {
+      if (seen.has(t.id)) { if (t.sticky !== '1') met = true; } else seen.set(t.id, t);
+    }
+    if (met || page.length < PAGE) return [...seen.values()];
+    if (skip + PAGE > MAX_SKIP) throw new StopRun(`Раздел ${forumId}: больше ${2 * (MAX_SKIP + PAGE)} тем, полная проверка невозможна.`);
   }
 }
 
 // Темы раздела, где писали не раньше since (сортировка по последнему посту).
 async function listRecent(forumId, since) {
   const out = [];
-  let prev = Infinity;
   for (let skip = 0; ; skip += PAGE) {
     const page = await api({ method: 'topic.get', forum_id: forumId, limit: PAGE, skip, sort_by: 'last_post', sort_dir: 'desc' });
     // Защита: если форум перестал сортировать, без неё мы бы молча пропускали темы.
     // Проверяем порядок на всей странице до того, как решать, где остановиться.
-    // Закреплённые темы могут стоять первыми вне сортировки — их не проверяем и берём всегда.
-    for (const t of page) {
-      if (t.sticky === '1') continue;
-      const d = +t.last_post_date;
-      if (d > prev) throw new StopRun(`Раздел ${forumId}: темы пришли не по дате последнего поста. Нужна полная проверка.`);
-      prev = d;
-    }
+    checkOrder(page, forumId, 'desc');
     for (const t of page) {
       if (t.sticky === '1') { out.push(t); continue; }
       if (+t.last_post_date < since) return out;
@@ -221,8 +244,10 @@ try {
 
   const since = (state.checkpoint || 0) - OVERLAP_S;
   let newest = state.checkpoint || 0;
+  const sizes = {};
   for (const f of FORUMS) {
     const topics = isFull ? await listTopics(f) : await listRecent(f, since);
+    sizes[f] = topics.length;
     for (const t of topics) {
       listed[t.id] = { f, lp: +t.last_post_id, nr: +t.num_replies };
       newest = Math.max(newest, +t.last_post_date);
@@ -236,7 +261,12 @@ try {
     if (prevTotal > 50 && total < prevTotal * 0.95) {
       throw new StopRun(`Было ${prevTotal} тем, пришло ${total}. Проверьте доступ читателя.`);
     }
+    for (const f of FORUMS) {
+      const prev = (state.forumSizes || {})[f] || 0;
+      if (prev >= 10 && sizes[f] === 0) throw new StopRun(`Раздел ${f}: было ${prev} тем, пришло 0. Проверьте доступ читателя.`);
+    }
     state.totalTopics = total;
+    state.forumSizes = sizes;
     for (const tid of Object.keys(state.topics)) if (!listed[tid]) delete state.topics[tid];
   }
   // Отметка двигается только после того, как списки получены целиком.
