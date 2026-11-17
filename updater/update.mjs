@@ -27,7 +27,9 @@ const FULL = env.FULL === 'true';
 const DATA_DIR = env.DATA_DIR || 'data';
 const MAX_REQUESTS = +env.MAX_REQUESTS || 400;
 const MIN_INTERVAL_MS = +env.MIN_INTERVAL_MS || 1500;
+const MAX_MINUTES = +env.MAX_MINUTES || 45; // запуск заканчивается сам, не дожидаясь таймаута GitHub
 const DRY_RUN = env.DRY_RUN === 'true';
+const STORAGE_KEY = env.STORAGE_KEY || 'gameposts';
 const CHECK_UIDS = (env.CHECK_UIDS || '').split(',').filter(Boolean);
 const PAGE = 100;
 const OVERLAP_S = 3600; // запас по времени при чтении «свежих» тем
@@ -41,6 +43,9 @@ if (!FORUM_URL || !LOGIN || !PASSWORD) {
 
 const cookies = new Map();
 let requestsUsed = 0;
+let budget = MAX_REQUESTS;
+let deadline = Date.now() + MAX_MINUTES * 60000;
+let loggedIn = false;
 let lastRequestAt = 0;
 
 class BudgetExhausted extends Error {}
@@ -60,7 +65,7 @@ function saveCookies(res) {
 async function request(url, options = {}) {
   let failures = 0;
   for (;;) {
-    if (requestsUsed >= MAX_REQUESTS) throw new BudgetExhausted();
+    if (requestsUsed >= budget || Date.now() > deadline) throw new BudgetExhausted();
     const wait = lastRequestAt + MIN_INTERVAL_MS - Date.now();
     if (wait > 0) await sleep(wait);
     lastRequestAt = Date.now();
@@ -68,9 +73,11 @@ async function request(url, options = {}) {
 
     let res;
     try {
+      if (requestsUsed % 100 === 0) console.log(`…запросов: ${requestsUsed}, минут: ${Math.round((Date.now() - deadline) / 60000 + MAX_MINUTES)}`);
       res = await fetch(url, {
         ...options,
         redirect: 'manual',
+        signal: AbortSignal.timeout(30000), // зависший ответ считается ошибкой через 30 с
         headers: {
           'User-Agent': 'gamepost-counter (GitHub Actions)',
           Cookie: [...cookies].map(([k, v]) => `${k}=${v}`).join('; '),
@@ -121,6 +128,7 @@ async function login() {
   });
   const probe = await api({ method: 'topic.get', forum_id: FORUMS[0], limit: 1 });
   if (!probe.length) throw new StopRun('Вход не удался или у читателя нет доступа к разделу ' + FORUMS[0]);
+  loggedIn = true;
 }
 
 // ---------- Подсчёт ----------
@@ -305,7 +313,7 @@ try {
     }
   }
 } catch (e) {
-  if (e instanceof BudgetExhausted) stopReason = `исчерпан лимит запросов (${MAX_REQUESTS}), продолжим в следующий запуск`;
+  if (e instanceof BudgetExhausted) stopReason = `исчерпан лимит запросов (${MAX_REQUESTS}) или времени (${MAX_MINUTES} мин), продолжим в следующий запуск`;
   else if (e instanceof StopRun) stopReason = e.message;
   else throw e;
 }
@@ -330,5 +338,32 @@ if (!DRY_RUN) {
   state.updated = Math.floor(Date.now() / 1000);
   fs.writeFileSync(statePath, JSON.stringify(state));
   fs.writeFileSync(publicPath, JSON.stringify({ updated: state.updated, pending, totals }));
+
+  // Итоги — в хранилище форума (storage аккаунта-читателя): игроки читают их с самого форума.
+  // Пишем, только если числа изменились. На запись запас в несколько запросов сверх лимита.
+  const value = JSON.stringify({ updated: state.updated, totals });
+  const hash = JSON.stringify(totals);
+  if (loggedIn && hash !== state.storedTotals) {
+    budget = requestsUsed + 5;
+    deadline = Infinity;
+    try {
+      const page = await (await request(`${FORUM_URL}/`)).text();
+      const ticket = (page.match(/ForumAPITicket\s*=\s*["']([^"']+)["']/) || [])[1];
+      if (!ticket) throw new Error('на странице нет ForumAPITicket');
+      const res = await request(`${FORUM_URL}/api.php`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ method: 'storage.set', token: ticket, key: STORAGE_KEY, value }).toString(),
+      });
+      const json = JSON.parse(await res.text());
+      if (json.error) throw new Error(json.error.message);
+      state.storedTotals = hash;
+      fs.writeFileSync(statePath, JSON.stringify(state));
+      console.log(`Записано в хранилище форума: ${Object.keys(totals).length} игроков, ${value.length} байт.`);
+    } catch (e) {
+      console.warn('Не удалось записать в хранилище форума: ' + e.message);
+      process.exitCode = 1;
+    }
+  }
 }
 if (stopReason && !stopReason.startsWith('исчерпан')) process.exitCode = 1;
